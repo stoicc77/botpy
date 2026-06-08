@@ -117,7 +117,11 @@ def apply_replacements(text: str) -> tuple[str, bool]:
 def fix_entities(entities: list, text: str) -> tuple[list, bool]:
     """
     Fix hyperlink URLs inside Telegram message entities.
-    Handles hidden hyperlinks like [JOIN](https://t.me/OLD/726)
+    Handles:
+      - text_link: hidden hyperlinks like [JOIN](https://t.me/OLD/726)
+      - url: plain visible links like https://t.me/OLD/726
+    For 'url' type: the URL is inside the text itself, so text replacement handles it.
+    We only need to handle text_link here (URL stored separately in entity).
     """
     if not entities:
         return entities, False
@@ -126,6 +130,7 @@ def fix_entities(entities: list, text: str) -> tuple[list, bool]:
     new_entities = []
 
     for ent in entities:
+        # text_link = hidden hyperlink, URL stored in entity
         if ent.get("type") == "text_link" and ent.get("url"):
             new_url, c = apply_replacements(ent["url"])
             if c:
@@ -138,13 +143,16 @@ def fix_entities(entities: list, text: str) -> tuple[list, bool]:
 
 def needs_replacement(text: str, entities: list) -> bool:
     """Quick check — does this message even contain the old username?"""
+    # Check plain text (covers url-type entities since URL is IN the text)
     if text and re.search(re.escape(OLD_USERNAME), text, re.IGNORECASE):
         return True
+    # Check text_link entity URLs (hidden hyperlinks)
     if entities:
         for ent in entities:
-            url = ent.get("url", "")
-            if url and re.search(re.escape(OLD_USERNAME), url, re.IGNORECASE):
-                return True
+            if ent.get("type") == "text_link":
+                url = ent.get("url", "")
+                if url and re.search(re.escape(OLD_USERNAME), url, re.IGNORECASE):
+                    return True
     return False
 
 
@@ -159,10 +167,18 @@ async def edit_channel_message(
     entities: list,
     is_caption: bool = False
 ) -> dict:
-    """Edit a channel message or caption with replaced content."""
+    """
+    Edit a channel message or caption with replaced content.
 
-    new_text, text_changed     = apply_replacements(text)
-    new_entities, ent_changed  = fix_entities(entities or [], text)
+    Strategy:
+    - Apply text replacement (handles plain URLs, @mentions, bare username)
+    - Apply entity fix for text_link type (hidden hyperlinks)
+    - Send back with entities to preserve ALL original formatting
+      (bold, italic, code, etc.) — but ONLY the text_link URLs are changed
+    """
+
+    new_text, text_changed    = apply_replacements(text)
+    new_entities, ent_changed = fix_entities(entities or [], text)
 
     if not text_changed and not ent_changed:
         return {"skipped": True}
@@ -174,6 +190,8 @@ async def edit_channel_message(
             message_id=msg_id,
             caption=new_text,
         )
+        if new_entities:
+            payload["caption_entities"] = new_entities
     else:
         method = "editMessageText"
         payload = dict(
@@ -181,14 +199,12 @@ async def edit_channel_message(
             message_id=msg_id,
             text=new_text,
         )
+        if new_entities:
+            payload["entities"] = new_entities
 
-    # Prefer sending entities over parse_mode to preserve formatting
-    if new_entities:
-        key = "caption_entities" if is_caption else "entities"
-        payload[key] = new_entities
-    else:
-        payload["parse_mode"] = "HTML"
-
+    # Note: we do NOT send parse_mode when sending entities
+    # Telegram ignores parse_mode if entities are present anyway
+    log.info(f"Editing {msg_id} | method={method} | has_entities={bool(new_entities)}")
     return await tg(method, **payload)
 
 
@@ -255,7 +271,8 @@ async def run_replacement(admin_chat: int, channel_id: str, from_id: int, to_id:
             )
 
         try:
-            # ── Step 1: Forward message to admin DM to read it ──
+            # ── Step 1: Forward message to admin DM to read its full content ──
+            # forwardMessage returns full message object including text + entities
             fwd = await tg(
                 "forwardMessage",
                 chat_id=admin_chat,
@@ -263,7 +280,7 @@ async def run_replacement(admin_chat: int, channel_id: str, from_id: int, to_id:
                 message_id=msg_id
             )
 
-            # Message deleted or doesn't exist
+            # Message deleted or doesn't exist — skip silently
             if not fwd.get("ok"):
                 skipped += 1
                 await asyncio.sleep(SKIP_DELAY)
@@ -274,11 +291,15 @@ async def run_replacement(admin_chat: int, channel_id: str, from_id: int, to_id:
 
             # Get text (normal message or caption for media)
             text       = fwd_msg.get("text") or fwd_msg.get("caption") or ""
+            # forward_origin wraps entities — get from forwarded message directly
             entities   = fwd_msg.get("entities") or fwd_msg.get("caption_entities") or []
-            is_caption = "caption" in fwd_msg
+            is_caption = bool(fwd_msg.get("caption"))
 
             # ── Step 2: Delete forwarded copy from admin DM ──────
             await delete_msg(admin_chat, fwd_msg_id)
+
+            # Debug log — helps verify what bot is seeing
+            log.info(f"ID {msg_id} | text={text[:60]!r} | entities={entities}")
 
             # ── Step 3: Check if replacement needed ──────────────
             if not needs_replacement(text, entities):
