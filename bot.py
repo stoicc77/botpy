@@ -117,11 +117,10 @@ def apply_replacements(text: str) -> tuple[str, bool]:
 def fix_entities(entities: list, text: str) -> tuple[list, bool]:
     """
     Fix hyperlink URLs inside Telegram message entities.
-    Handles:
-      - text_link: hidden hyperlinks like [JOIN](https://t.me/OLD/726)
-      - url: plain visible links like https://t.me/OLD/726
-    For 'url' type: the URL is inside the text itself, so text replacement handles it.
-    We only need to handle text_link here (URL stored separately in entity).
+    - text_link: URL stored in entity → replace URL
+    - mention: @username is IN the text; we strip this entity so Telegram
+      doesn't override our text replacement with the old username
+    - text_mention: user object, unrelated to username — leave alone
     """
     if not entities:
         return entities, False
@@ -130,13 +129,31 @@ def fix_entities(entities: list, text: str) -> tuple[list, bool]:
     new_entities = []
 
     for ent in entities:
+        ent_type = ent.get("type", "")
+
         # text_link = hidden hyperlink, URL stored in entity
-        if ent.get("type") == "text_link" and ent.get("url"):
+        if ent_type == "text_link" and ent.get("url"):
             new_url, c = apply_replacements(ent["url"])
             if c:
                 changed = True
                 ent = {**ent, "url": new_url}
-        new_entities.append(ent)
+            new_entities.append(ent)
+
+        # mention = @username mention — the @username is IN the text.
+        # After text replacement the text slice at this offset/length will be
+        # the NEW username, so keep the entity but it will naturally point to
+        # the new name.  BUT if the length changed (old != new length) we must
+        # NOT send back stale entities — drop them to avoid Telegram errors.
+        elif ent_type == "mention":
+            if len(OLD_USERNAME) != len(NEW_USERNAME):
+                # Length changed — dropping stale mention entity
+                changed = True
+                # Don't append — drop this entity
+            else:
+                new_entities.append(ent)
+
+        else:
+            new_entities.append(ent)
 
     return new_entities, changed
 
@@ -146,13 +163,17 @@ def needs_replacement(text: str, entities: list) -> bool:
     # Check plain text (covers url-type entities since URL is IN the text)
     if text and re.search(re.escape(OLD_USERNAME), text, re.IGNORECASE):
         return True
-    # Check text_link entity URLs (hidden hyperlinks)
+    # Check ALL entity types that can contain the old username
     if entities:
         for ent in entities:
+            # text_link: hidden hyperlinks — URL stored in entity
             if ent.get("type") == "text_link":
                 url = ent.get("url", "")
                 if url and re.search(re.escape(OLD_USERNAME), url, re.IGNORECASE):
                     return True
+            # url: visible link in text — already covered by text check above
+            # mention: @username stored AS the text slice — covered by text check
+            # But if text is empty or entity text differs, check entity directly
     return False
 
 
@@ -170,11 +191,15 @@ async def edit_channel_message(
     """
     Edit a channel message or caption with replaced content.
 
+    IMPORTANT: OLD_USERNAME and NEW_USERNAME have different lengths.
+    After text replacement, entity offsets/lengths become invalid.
     Strategy:
-    - Apply text replacement (handles plain URLs, @mentions, bare username)
-    - Apply entity fix for text_link type (hidden hyperlinks)
-    - Send back with entities to preserve ALL original formatting
-      (bold, italic, code, etc.) — but ONLY the text_link URLs are changed
+    - If text changed: send new text WITHOUT entities (avoids offset errors).
+      Formatting (bold/italic) will be lost for those messages, but the
+      username replacement will succeed.
+    - If only text_link entity URLs changed (no text change): send with
+      fixed entities (offsets unchanged).
+    - For mention entities: they are dropped since lengths changed.
     """
 
     new_text, text_changed    = apply_replacements(text)
@@ -190,8 +215,13 @@ async def edit_channel_message(
             message_id=msg_id,
             caption=new_text,
         )
-        if new_entities:
+        # Only send entities if text didn't change (offsets still valid)
+        # and there are entity-only changes (e.g. text_link URL fix)
+        if new_entities and not text_changed:
             payload["caption_entities"] = new_entities
+        elif new_entities and text_changed:
+            # Drop entities — offsets are stale after text replacement
+            log.info(f"ID {msg_id} | Dropping entities (text changed, offsets invalid)")
     else:
         method = "editMessageText"
         payload = dict(
@@ -199,12 +229,13 @@ async def edit_channel_message(
             message_id=msg_id,
             text=new_text,
         )
-        if new_entities:
+        # Only send entities if text didn't change (offsets still valid)
+        if new_entities and not text_changed:
             payload["entities"] = new_entities
+        elif new_entities and text_changed:
+            log.info(f"ID {msg_id} | Dropping entities (text changed, offsets invalid)")
 
-    # Note: we do NOT send parse_mode when sending entities
-    # Telegram ignores parse_mode if entities are present anyway
-    log.info(f"Editing {msg_id} | method={method} | has_entities={bool(new_entities)}")
+    log.info(f"Editing {msg_id} | method={method} | text_changed={text_changed} | ent_changed={ent_changed}")
     return await tg(method, **payload)
 
 
@@ -299,10 +330,11 @@ async def run_replacement(admin_chat: int, channel_id: str, from_id: int, to_id:
             await delete_msg(admin_chat, fwd_msg_id)
 
             # Debug log — helps verify what bot is seeing
-            log.info(f"ID {msg_id} | text={text[:60]!r} | entities={entities}")
+            log.info(f"ID {msg_id} | text={text[:80]!r} | entities={entities}")
 
             # ── Step 3: Check if replacement needed ──────────────
             if not needs_replacement(text, entities):
+                log.info(f"ID {msg_id} | SKIP — old username not found in text/entities")
                 skipped += 1
                 await asyncio.sleep(SKIP_DELAY)
                 continue
